@@ -6,6 +6,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_lm.models import switch_kernels
+from mlx_lm.models.activations import SwigluOAI
 from mlx_lm.models.switch_layers import SwiGLU, SwitchGLU
 
 
@@ -90,6 +91,67 @@ class TestSwitchKernels(unittest.TestCase):
         many = mx.zeros((1, 512, 4), mx.uint32)
         self.assertIsNone(
             switch_kernels.switch_glu(glu, mx.zeros((1, 512, 256), mx.bfloat16), many)
+        )
+
+
+def mxfp4_glu(D, F, E, activation):
+    glu = SwitchGLU(D, F, E, activation=activation, bias=True)
+    for p in (glu.gate_proj, glu.up_proj, glu.down_proj):
+        p.bias = mx.random.normal(p.bias.shape) * 0.1
+    nn.quantize(glu, group_size=32, bits=4, mode="mxfp4")
+    mx.eval(glu.parameters())
+    return glu
+
+
+def stock(glu, x, idx):
+    kernels, switch_kernels._fp4_kernels = switch_kernels._fp4_kernels, None
+    try:
+        return glu(x, idx)
+    finally:
+        switch_kernels._fp4_kernels = kernels
+
+
+@unittest.skipIf(not mx.metal.is_available(), "Metal only")
+class TestSwitchKernelsMXFP4(unittest.TestCase):
+    def test_matches_generic_path(self):
+        mx.random.seed(2)
+        for D, F, E, k in [(256, 192, 8, 4), (512, 384, 32, 4)]:
+            for act in (SwigluOAI(), SwiGLU()):
+                glu = mxfp4_glu(D, F, E, act)
+                for T in (1, 2, 3, 8, 17):
+                    if T * k / E > switch_kernels.FP4_MAX_LOAD:
+                        continue
+                    x = mx.random.normal((1, T, D)).astype(mx.bfloat16)
+                    idx = mx.argsort(mx.random.uniform(shape=(1, T, E)), axis=-1)[
+                        ..., :k
+                    ]
+                    y = switch_kernels.switch_glu(glu, x, idx)
+                    self.assertIsNotNone(y)
+                    ref = stock(glu, x.astype(mx.float32), idx).astype(mx.float32)
+                    err = rel_err(y.astype(mx.float32), ref)
+                    self.assertLess(err, 2e-2, (D, F, E, k, T, type(act).__name__, err))
+
+    def test_gradient(self):
+        mx.random.seed(3)
+        glu = mxfp4_glu(256, 192, 8, SwigluOAI())
+        x = mx.random.normal((1, 3, 256)).astype(mx.bfloat16)
+        idx = mx.argsort(mx.random.uniform(shape=(1, 3, 8)), axis=-1)[..., :4]
+        loss = lambda x: glu(x, idx).astype(mx.float32).sum()
+        g_fast = mx.grad(loss)(x)
+        kernels, switch_kernels._fp4_kernels = switch_kernels._fp4_kernels, None
+        try:
+            g_ref = mx.grad(loss)(x)
+        finally:
+            switch_kernels._fp4_kernels = kernels
+        self.assertLess(
+            rel_err(g_fast.astype(mx.float32), g_ref.astype(mx.float32)), 2e-2
+        )
+
+    def test_other_activation_constants_fall_back(self):
+        glu = mxfp4_glu(256, 192, 8, SwigluOAI(alpha=1.0))
+        x = mx.random.normal((1, 2, 256)).astype(mx.bfloat16)
+        self.assertIsNone(
+            switch_kernels.switch_glu(glu, x, mx.zeros((1, 2, 4), mx.uint32))
         )
 
 

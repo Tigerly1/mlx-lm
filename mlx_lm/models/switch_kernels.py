@@ -569,6 +569,8 @@ def max_load(D, F):
 
 def switch_glu(glu, x, indices):
     """Per-slot output of SwitchGLU `glu` (as SwitchGLU.__call__), or None if this path does not apply."""
+    if getattr(glu.gate_proj, "mode", None) == "mxfp4":
+        return _switch_glu_fp4(glu, x, indices)
     act = getattr(glu.activation, "metal_act", None)
     if _kernels is None or act is None or x.dtype not in (mx.bfloat16, mx.float16):
         return None
@@ -588,4 +590,542 @@ def switch_glu(glu, x, indices):
         return None
     weights = [a for p in projs for a in (p.weight, p.scales, p.biases)]
     y = _ops[act](x.reshape(T, D), indices.reshape(T, k).astype(mx.uint32), *weights)
+    return y.reshape(*indices.shape, D)
+
+
+# ---------------------------------------------------------------------------------------------
+# MXFP4 experts (gpt-oss): E2M1 weights, E8M0 scales per 32, fp32-added biases, SwiGLU (ACT 0)
+# or gpt-oss's clamped SwiGLU (ACT 1: alpha 1.702, limit 7). Per-slot outputs come from the
+# pair (T < 8) and group (T >= 8) kernels with unit routing weights; the k-sum stays in the model.
+# ---------------------------------------------------------------------------------------------
+
+FP4_HEADER = """
+// two E2M1 codes (bits 0..3 and 16..19 of p) -> half2, value * 2^-14 (exact)
+inline half2 fp4x2(uint p) {
+    return as_type<half2>(((p & 0x00080008u) << 12) | ((p & 0x00070007u) << 9));
+}
+// E8M0 scale byte -> float 2^(s-127), exact for s = 1..254 (s = 0 -> 0). The decode's 2^-14 is undone once
+// per output (swiglu / routing weight * 2^14), not folded in here: (s + 14) << 23 overflows for s >= 241.
+inline float e8s(uint s) { return as_type<float>(s << 23); }
+inline float swiglu(float g, float u) { g *= 0x1p14f; return g / (1.f + metal::exp(-g)) * (u * 0x1p14f); }
+template <typename T>
+inline void load_x32(const device T* xp, thread float* xs) {
+    for (uint i = 0; i < 32; ++i) xs[i] = float(xp[i]);
+}
+// dot of 32 fp4 weights (one uint4) with 32 floats. nibble i of word j <-> weight 8j + i.
+inline float dot_fp4x32(thread const float* xs, uint4 w) {
+    float acc = 0.f;
+    for (uint j = 0; j < 4; ++j) {
+        uint word = w[j];
+        for (uint i = 0; i < 4; ++i) {
+            float2 v = float2(fp4x2(word >> (4 * i)));
+            acc = fma(xs[j * 8 + i], v.x, acc);
+            acc = fma(xs[j * 8 + i + 4], v.y, acc);
+        }
+    }
+    return acc;
+}
+// two activation vectors share one weight decode
+inline void dot2_fp4x32(thread const float* xa, thread const float* xb, uint4 w, thread float& da, thread float& db) {
+    float a = 0.f, b = 0.f;
+    for (uint j = 0; j < 4; ++j) {
+        uint word = w[j];
+        for (uint i = 0; i < 4; ++i) {
+            float2 v = float2(fp4x2(word >> (4 * i)));
+            a = fma(xa[j * 8 + i], v.x, a); a = fma(xa[j * 8 + i + 4], v.y, a);
+            b = fma(xb[j * 8 + i], v.x, b); b = fma(xb[j * 8 + i + 4], v.y, b);
+        }
+    }
+    da = a; db = b;
+}
+
+template <int A>
+inline float act(float g, float u) {
+    if (A == 0) return g / (1.f + metal::exp(-g)) * u;
+    g = metal::min(g, 7.0f);
+    u = metal::clamp(u, -7.0f, 7.0f);
+    return g / (1.f + metal::exp(-1.702f * g)) * (u + 1.f);
+}
+"""
+
+FP4_PAIR_GATE_UP = """
+    uint lane = thread_index_in_simdgroup;
+    uint row0 = (thread_position_in_grid.x / 32) * R;
+    uint slot = thread_position_in_grid.y;
+    if (row0 >= F) return;
+    constexpr uint NC = D / 32;
+    int e = idx[slot];
+
+    uint rank = 0, nxt = TK;
+    for (uint q = lane; q < TK; q += 32) {
+        bool same = idx[q] == e;
+        rank += (same && q < slot) ? 1u : 0u;
+        if (same && q > slot) nxt = min(nxt, q);
+    }
+    rank = simd_sum(rank); nxt = simd_min(nxt);
+    if (rank & 1u) return;
+
+    size_t r0 = (size_t)e * F + row0;
+    const device T* xr = x + (slot / K) * D;
+    float xs[32];
+    if (nxt == TK) {
+        float ag[R] = {0.f}, au[R] = {0.f};
+        for (uint c = lane; c < NC; c += 32) {
+            load_x32(xr + c * 32, xs);
+            for (uint r = 0; r < R; ++r) {
+                size_t q = (r0 + r) * NC + c;
+                ag[r] += e8s(gs[q]) * dot_fp4x32(xs, ((const device uint4*)gq)[q]);
+                au[r] += e8s(us[q]) * dot_fp4x32(xs, ((const device uint4*)uq)[q]);
+            }
+        }
+        for (uint r = 0; r < R; ++r) {
+            float g = simd_sum(ag[r]), u = simd_sum(au[r]);
+            if (lane == 0) h[slot * F + row0 + r] = T(act<ACT>(g * 0x1p14f + bg[r0 + r], u * 0x1p14f + bu[r0 + r]));
+        }
+        return;
+    }
+    const device T* xr2 = x + (nxt / K) * D;
+    float xt[32];
+    float ga[R] = {0.f}, gb[R] = {0.f}, ua[R] = {0.f}, ub[R] = {0.f};
+    for (uint c = lane; c < NC; c += 32) {
+        load_x32(xr + c * 32, xs);
+        load_x32(xr2 + c * 32, xt);
+        for (uint r = 0; r < R; ++r) {
+            size_t q = (r0 + r) * NC + c;
+            float a, b, sg = e8s(gs[q]), su = e8s(us[q]);
+            dot2_fp4x32(xs, xt, ((const device uint4*)gq)[q], a, b); ga[r] += sg * a; gb[r] += sg * b;
+            dot2_fp4x32(xs, xt, ((const device uint4*)uq)[q], a, b); ua[r] += su * a; ub[r] += su * b;
+        }
+    }
+    for (uint r = 0; r < R; ++r) {
+        float g = simd_sum(ga[r]), u = simd_sum(ua[r]), g2 = simd_sum(gb[r]), u2 = simd_sum(ub[r]);
+        if (lane == 0) {
+            h[slot * F + row0 + r] = T(act<ACT>(g * 0x1p14f + bg[r0 + r], u * 0x1p14f + bu[r0 + r]));
+            h[nxt * F + row0 + r] = T(act<ACT>(g2 * 0x1p14f + bg[r0 + r], u2 * 0x1p14f + bu[r0 + r]));
+        }
+    }
+"""
+
+FP4_PAIR_DOWN = """
+    constexpr uint RB = R * 32 / LPR;
+    uint lane = thread_index_in_simdgroup;
+    uint sub = lane % LPR;
+    uint row0 = (thread_position_in_grid.x / 32) * RB + (lane / LPR) * R;
+    uint slot = thread_position_in_grid.y;
+    int e = idx[slot];
+
+    uint rank = 0, nxt = TK;
+    for (uint q = lane; q < TK; q += 32) {
+        bool same = idx[q] == e;
+        rank += (same && q < slot) ? 1u : 0u;
+        if (same && q > slot) nxt = min(nxt, q);
+    }
+    rank = simd_sum(rank); nxt = simd_min(nxt);
+    if (rank & 1u) return;
+
+    bool ok = row0 < D;
+    constexpr uint NC = F / 32;
+    size_t r0 = (size_t)e * D + (ok ? row0 : 0);
+    float hs[32], ht[32];
+    float aa[R] = {0.f}, ab[R] = {0.f};
+    if (nxt == TK) {
+        for (uint c = sub; ok && c < NC; c += LPR) {
+            load_x32(h + slot * F + c * 32, hs);
+            for (uint r = 0; r < R; ++r) {
+                size_t q = (r0 + r) * NC + c;
+                aa[r] += e8s(ds[q]) * dot_fp4x32(hs, ((const device uint4*)dq)[q]);
+            }
+        }
+    } else {
+        for (uint c = sub; ok && c < NC; c += LPR) {
+            load_x32(h + slot * F + c * 32, hs);
+            load_x32(h + nxt * F + c * 32, ht);
+            for (uint r = 0; r < R; ++r) {
+                size_t q = (r0 + r) * NC + c;
+                float a, b, sd = e8s(ds[q]);
+                dot2_fp4x32(hs, ht, ((const device uint4*)dq)[q], a, b);
+                aa[r] += sd * a; ab[r] += sd * b;
+            }
+        }
+    }
+    float wa = wts[slot] * 0x1p14f, wb = wts[min(nxt, uint(TK - 1))] * 0x1p14f;
+    for (uint r = 0; r < R; ++r) {
+        float a = aa[r], b = ab[r];
+        for (uint o = LPR / 2; o > 0; o >>= 1) { a += simd_shuffle_xor(a, o); b += simd_shuffle_xor(b, o); }
+        if (sub == 0 && ok) {
+            yp[slot * D + row0 + r] = wa * (a + bd[r0 + r] * 0x1p-14f);
+            if (nxt < TK) yp[nxt * D + row0 + r] = wb * (b + bd[r0 + r] * 0x1p-14f);
+        }
+    }
+"""
+
+FP4_MAP = """
+    uint p = thread_position_in_grid.x;
+    if (p >= TK) return;
+    int e = idx[p];
+    uint rank = 0;
+    for (uint q = 0; q < p; ++q) rank += (idx[q] == e) ? 1u : 0u;
+    device uint* t = tl + p * (G + 1);
+    if (rank % G != 0) { t[0] = 0; return; }
+    uint n = 0;
+    for (uint q = p; q < TK && n < G; ++q) if (idx[q] == e) t[1 + n++] = q;
+    t[0] = n;
+"""
+
+FP4_GROUP_GATE_UP = """
+    uint lane = thread_index_in_simdgroup;
+    uint sg = simdgroup_index_in_threadgroup;
+    uint row0 = threadgroup_position_in_grid.x * RT;
+    constexpr uint RS = RT / 8, LPR = 32 / RS, SK = 64 / RT;  // scalar: RS rows/simdgroup; MMA: SK-way K split
+    uint slot = thread_position_in_grid.y;
+    threadgroup float red[8 * 128];
+    if (row0 >= NR) return;
+    const device uint* tt = tl + slot * (G + 1);
+    uint n = tt[0];
+    if (n == 0) return;
+    int e = idx[slot];
+    uint m[G];
+    for (uint i = 0; i < G; ++i) m[i] = tt[1 + min(i, n - 1)];
+    uint sub = lane % LPR;
+    uint row = row0 + sg * RS + lane / LPR;
+    uint rbk = sg / SK, ks = sg % SK;
+    constexpr uint NC = NK / 32;
+    // MMA fragment coordinates
+    uint qid = lane / 4;
+    uint fm = (qid & 4) + ((lane / 2) % 4);
+    uint fn = (qid & 2) * 2 + (lane % 2) * 2;
+    uint s0 = m[min(fn, n - 1)], s1 = m[min(fn + 1, n - 1)];
+    uint rowm = row0 + rbk * 8 + fm;
+    size_t rf = (size_t)e * NR + rowm;
+
+    size_t rr = (size_t)e * F + row;
+    if (n <= 2) {
+        const device T* xr = x + (slot / K) * D;
+        float xs[32], ga = 0.f, ua = 0.f, gb = 0.f, ub = 0.f;
+        if (n == 1) {
+            for (uint c = sub; c < NC; c += LPR) {
+                load_x32(xr + c * 32, xs);
+                size_t q = rr * NC + c;
+                ga += e8s(gs[q]) * dot_fp4x32(xs, ((const device uint4*)gq)[q]);
+                ua += e8s(us[q]) * dot_fp4x32(xs, ((const device uint4*)uq)[q]);
+            }
+        } else {
+            const device T* xr2 = x + (m[1] / K) * D;
+            float xt[32];
+            for (uint c = sub; c < NC; c += LPR) {
+                load_x32(xr + c * 32, xs);
+                load_x32(xr2 + c * 32, xt);
+                size_t q = rr * NC + c;
+                float a, b, sg_ = e8s(gs[q]), su = e8s(us[q]);
+                dot2_fp4x32(xs, xt, ((const device uint4*)gq)[q], a, b); ga += sg_ * a; gb += sg_ * b;
+                dot2_fp4x32(xs, xt, ((const device uint4*)uq)[q], a, b); ua += su * a; ub += su * b;
+            }
+        }
+        for (uint o = LPR / 2; o > 0; o >>= 1) {
+            ga += simd_shuffle_xor(ga, o); ua += simd_shuffle_xor(ua, o);
+            gb += simd_shuffle_xor(gb, o); ub += simd_shuffle_xor(ub, o);
+        }
+        if (sub == 0) {
+            h[slot * F + row] = T(act<ACT>(ga * 0x1p14f + bg[rr], ua * 0x1p14f + bu[rr]));
+            if (n == 2) h[m[1] * F + row] = T(act<ACT>(gb * 0x1p14f + bg[rr], ub * 0x1p14f + bu[rr]));
+        }
+        return;
+    }
+    const device T* xa = x + (s0 / K) * D + fm * 4;
+    const device T* xb = x + (s1 / K) * D + fm * 4;
+    const device uint* gw = gq + rf * (NK / 8) + fn / 2;
+    const device uint* uw = uq + rf * (NK / 8) + fn / 2;
+    simdgroup_matrix<float, 8, 8> Cg = make_filled_simdgroup_matrix<float, 8, 8>(0.f);
+    simdgroup_matrix<float, 8, 8> Cu = make_filled_simdgroup_matrix<float, 8, 8>(0.f);
+    simdgroup_matrix<float, 8, 8> Pg, Pu;
+    simdgroup_matrix<half, 8, 8> Ag, Au, B;
+    for (uint g = ks; g < NC; g += SK) {
+        uint wg = gw[g * 4], wu = uw[g * 4];
+        float sg_ = e8s(gs[rf * NC + g]), su = e8s(us[rf * NC + g]);
+        half4 a0 = half4(*(const device vec<T, 4>*)(xa + g * 32)), b0 = half4(*(const device vec<T, 4>*)(xb + g * 32));
+        for (uint s = 0; s < 4; ++s) {
+            half2 vg = fp4x2(wg >> (4 * s)), vu = fp4x2(wu >> (4 * s));
+            Ag.thread_elements()[0] = vg.x; Ag.thread_elements()[1] = vg.y;
+            Au.thread_elements()[0] = vu.x; Au.thread_elements()[1] = vu.y;
+            B.thread_elements()[0] = a0[s]; B.thread_elements()[1] = b0[s];
+            if (s == 0) { simdgroup_multiply(Pg, Ag, B); simdgroup_multiply(Pu, Au, B); }
+            else { simdgroup_multiply_accumulate(Pg, Ag, B, Pg); simdgroup_multiply_accumulate(Pu, Au, B, Pu); }
+        }
+        for (uint i = 0; i < 2; ++i) {
+            Cg.thread_elements()[i] = fma(sg_, Pg.thread_elements()[i], Cg.thread_elements()[i]);
+            Cu.thread_elements()[i] = fma(su, Pu.thread_elements()[i], Cu.thread_elements()[i]);
+        }
+    }
+    for (uint i = 0; i < 2; ++i) {
+        red[sg * 128 + lane * 2 + i] = Cg.thread_elements()[i];
+        red[sg * 128 + 64 + lane * 2 + i] = Cu.thread_elements()[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ks != 0) return;
+    for (uint i = 0; i < 2; ++i) {
+        float g = 0.f, u = 0.f;
+        for (uint j = 0; j < SK; ++j) { g += red[(sg + j) * 128 + lane * 2 + i]; u += red[(sg + j) * 128 + 64 + lane * 2 + i]; }
+        if (fn + i < n) h[m[fn + i] * F + rowm] = T(act<ACT>(g * 0x1p14f + bg[rf], u * 0x1p14f + bu[rf]));
+    }
+"""
+
+FP4_GROUP_DOWN = """
+    uint lane = thread_index_in_simdgroup;
+    uint sg = simdgroup_index_in_threadgroup;
+    uint row0 = threadgroup_position_in_grid.x * RT;
+    constexpr uint RS = RT / 8, LPR = 32 / RS, SK = 64 / RT;  // scalar: RS rows/simdgroup; MMA: SK-way K split
+    uint slot = thread_position_in_grid.y;
+    threadgroup float red[8 * 128];
+    if (row0 >= NR) return;
+    const device uint* tt = tl + slot * (G + 1);
+    uint n = tt[0];
+    if (n == 0) return;
+    int e = idx[slot];
+    uint m[G];
+    for (uint i = 0; i < G; ++i) m[i] = tt[1 + min(i, n - 1)];
+    uint sub = lane % LPR;
+    uint row = row0 + sg * RS + lane / LPR;
+    uint rbk = sg / SK, ks = sg % SK;
+    constexpr uint NC = NK / 32;
+    // MMA fragment coordinates
+    uint qid = lane / 4;
+    uint fm = (qid & 4) + ((lane / 2) % 4);
+    uint fn = (qid & 2) * 2 + (lane % 2) * 2;
+    uint s0 = m[min(fn, n - 1)], s1 = m[min(fn + 1, n - 1)];
+    uint rowm = row0 + rbk * 8 + fm;
+    size_t rf = (size_t)e * NR + rowm;
+
+    size_t rr = (size_t)e * D + row;
+    if (n <= 2) {
+        float hs[32], a = 0.f, b2 = 0.f;
+        if (n == 1) {
+            for (uint c = sub; c < NC; c += LPR) {
+                load_x32(h + slot * F + c * 32, hs);
+                size_t q = rr * NC + c;
+                a += e8s(ds[q]) * dot_fp4x32(hs, ((const device uint4*)dq)[q]);
+            }
+        } else {
+            float ht[32];
+            for (uint c = sub; c < NC; c += LPR) {
+                load_x32(h + slot * F + c * 32, hs);
+                load_x32(h + m[1] * F + c * 32, ht);
+                size_t q = rr * NC + c;
+                float da, db, sd = e8s(ds[q]);
+                dot2_fp4x32(hs, ht, ((const device uint4*)dq)[q], da, db);
+                a += sd * da; b2 += sd * db;
+            }
+        }
+        for (uint o = LPR / 2; o > 0; o >>= 1) { a += simd_shuffle_xor(a, o); b2 += simd_shuffle_xor(b2, o); }
+        if (sub == 0) {
+            yp[slot * D + row] = wts[slot] * (0x1p14f * a + bd[rr]);
+            if (n == 2) yp[m[1] * D + row] = wts[m[1]] * (0x1p14f * b2 + bd[rr]);
+        }
+        return;
+    }
+    const device T* ha = h + s0 * F + fm * 4;
+    const device T* hb = h + s1 * F + fm * 4;
+    const device uint* dw = dq + rf * (NK / 8) + fn / 2;
+    simdgroup_matrix<float, 8, 8> C = make_filled_simdgroup_matrix<float, 8, 8>(0.f);
+    simdgroup_matrix<float, 8, 8> P;
+    simdgroup_matrix<half, 8, 8> A, B;
+    for (uint g = ks; g < NC; g += SK) {
+        uint w = dw[g * 4];
+        float sd = e8s(ds[rf * NC + g]);
+        half4 a0 = half4(*(const device vec<T, 4>*)(ha + g * 32)), b0 = half4(*(const device vec<T, 4>*)(hb + g * 32));
+        for (uint s = 0; s < 4; ++s) {
+            half2 v = fp4x2(w >> (4 * s));
+            A.thread_elements()[0] = v.x; A.thread_elements()[1] = v.y;
+            B.thread_elements()[0] = a0[s]; B.thread_elements()[1] = b0[s];
+            if (s == 0) simdgroup_multiply(P, A, B);
+            else simdgroup_multiply_accumulate(P, A, B, P);
+        }
+        for (uint i = 0; i < 2; ++i) C.thread_elements()[i] = fma(sd, P.thread_elements()[i], C.thread_elements()[i]);
+    }
+    for (uint i = 0; i < 2; ++i) red[sg * 128 + lane * 2 + i] = C.thread_elements()[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ks != 0) return;
+    for (uint i = 0; i < 2; ++i) {
+        float a = 0.f;
+        for (uint j = 0; j < SK; ++j) a += red[(sg + j) * 128 + lane * 2 + i];
+        if (fn + i < n) yp[m[fn + i] * D + rowm] = wts[m[fn + i]] * (0x1p14f * a + bd[rf]);
+    }
+"""
+
+
+FP4_R_UP, FP4_R_DOWN, FP4_SG, FP4_T_GROUP, FP4_G, FP4_RT_UP, FP4_RT_DOWN = (
+    1,
+    2,
+    4,
+    8,
+    8,
+    16,
+    32,
+)
+
+
+def _make_fp4_kernels():
+    if not mx.metal.is_available():
+        return None
+    mk = partial(mx.fast.metal_kernel, header=FP4_HEADER)
+    w = ["gq", "gs", "uq", "us", "bg", "bu"]
+    return {
+        "pair_gate_up": mk(
+            name="switch_glu_fp4_pair_gate_up",
+            input_names=["x", *w, "idx"],
+            output_names=["h"],
+            source=FP4_PAIR_GATE_UP,
+        ),
+        "pair_down": mk(
+            name="switch_glu_fp4_pair_down",
+            input_names=["h", "dq", "ds", "bd", "idx", "wts"],
+            output_names=["yp"],
+            source=FP4_PAIR_DOWN,
+        ),
+        "map": mx.fast.metal_kernel(
+            name="switch_glu_fp4_map",
+            input_names=["idx"],
+            output_names=["tl"],
+            source=FP4_MAP,
+        ),
+        "group_gate_up": mk(
+            name="switch_glu_fp4_group_gate_up",
+            input_names=["x", *w, "idx", "tl"],
+            output_names=["h"],
+            source=FP4_GROUP_GATE_UP,
+        ),
+        "group_down": mk(
+            name="switch_glu_fp4_group_down",
+            input_names=["h", "dq", "ds", "bd", "idx", "wts", "tl"],
+            output_names=["yp"],
+            source=FP4_GROUP_DOWN,
+        ),
+    }
+
+
+_fp4_kernels = _make_fp4_kernels()
+
+
+def _rows_per_tg(nr, rt):
+    while nr % rt:
+        rt //= 2
+    return rt
+
+
+def _forward_fp4(x, indices, weights, act):
+    """x: [T, D], indices: [T, k] -> per-slot expert outputs [T * k, D] (biases included)."""
+    gq, gs, uq, us, dq, ds, bg, bu, bd = weights
+    T, k = indices.shape
+    F, D = gq.shape[1], dq.shape[1]
+    n = T * k
+    ones = mx.ones((n,), mx.float32)
+    base = [("T", x.dtype), ("D", D), ("F", F), ("K", k), ("ACT", act), ("TK", n)]
+    w = [gq, gs, uq, us, bg, bu]
+    K = _fp4_kernels
+    if T < FP4_T_GROUP:
+        h = K["pair_gate_up"](
+            inputs=[x, *w, indices],
+            template=base + [("R", FP4_R_UP)],
+            grid=(32 * F // FP4_R_UP, n, 1),
+            threadgroup=(32 * FP4_SG, 1, 1),
+            output_shapes=[(n, F)],
+            output_dtypes=[x.dtype],
+        )[0]
+        lpr = _lanes_per_row(F // 32)
+        rb = FP4_R_DOWN * 32 // lpr
+        y = K["pair_down"](
+            inputs=[h, dq, ds, bd, indices, ones],
+            template=base + [("R", FP4_R_DOWN), ("LPR", lpr)],
+            grid=(32 * (-(-D // rb)), n, 1),
+            threadgroup=(32 * FP4_SG, 1, 1),
+            output_shapes=[(n, D)],
+            output_dtypes=[mx.float32],
+        )[0]
+    else:
+        rt_up, rt_down = _rows_per_tg(F, FP4_RT_UP), _rows_per_tg(D, FP4_RT_DOWN)
+        tl = K["map"](
+            inputs=[indices],
+            template=[("TK", n), ("G", FP4_G)],
+            grid=(n, 1, 1),
+            threadgroup=(min(n, 256), 1, 1),
+            output_shapes=[(n * (FP4_G + 1),)],
+            output_dtypes=[mx.uint32],
+        )[0]
+        h = K["group_gate_up"](
+            inputs=[x, *w, indices, tl],
+            template=base + [("G", FP4_G), ("NR", F), ("NK", D), ("RT", rt_up)],
+            grid=(256 * F // rt_up, n, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[(n, F)],
+            output_dtypes=[x.dtype],
+        )[0]
+        y = K["group_down"](
+            inputs=[h, dq, ds, bd, indices, ones, tl],
+            template=base + [("G", FP4_G), ("NR", D), ("NK", F), ("RT", rt_down)],
+            grid=(256 * D // rt_down, n, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[(n, D)],
+            output_dtypes=[mx.float32],
+        )[0]
+    return y.astype(x.dtype)
+
+
+def _reference_fp4(x, indices, weights, act):
+    gq, gs, uq, us, dq, ds, bg, bu, bd = weights
+    xx = mx.expand_dims(x, (-2, -3))
+    mm = partial(mx.gather_qmm, rhs_indices=indices, transpose=True, mode="mxfp4")
+    g = mm(xx, gq, gs) + mx.expand_dims(bg[indices], -2)
+    u = mm(xx, uq, us) + mx.expand_dims(bu[indices], -2)
+    if act == 0:
+        a = nn.silu(g) * u
+    else:
+        g, u = mx.minimum(g, 7.0), mx.clip(u, -7.0, 7.0)
+        a = g * mx.sigmoid(1.702 * g) * (u + 1.0)
+    y = mm(a.astype(x.dtype), dq, ds) + mx.expand_dims(bd[indices], -2)
+    return y.squeeze(-2).reshape(-1, x.shape[-1])
+
+
+def _make_fp4_op(act):
+    @mx.custom_function
+    def op(x, indices, *weights):
+        return _forward_fp4(x, indices, weights, act)
+
+    @op.vjp
+    def op(primals, cotangent, output):
+        x, indices, *weights = primals
+        _, (dx,) = mx.vjp(
+            lambda x: _reference_fp4(x, indices, weights, act), [x], [cotangent]
+        )
+        return (dx, mx.zeros_like(indices), *(mx.zeros_like(w) for w in weights))
+
+    return op
+
+
+_fp4_ops = {0: _make_fp4_op(0), 1: _make_fp4_op(1)}
+
+FP4_MAX_LOAD = 16  # average tokens per expert up to which these kernels beat gather_qmm (gpt-oss shapes)
+
+
+def _switch_glu_fp4(glu, x, indices):
+    projs = (glu.gate_proj, glu.up_proj, glu.down_proj)
+    act = getattr(glu.activation, "metal_act_fp4", None)
+    if _fp4_kernels is None or act is None or x.dtype not in (mx.bfloat16, mx.float16):
+        return None
+    for p in projs:
+        fmt = (
+            getattr(p, "bits", None),
+            getattr(p, "group_size", None),
+            getattr(p, "mode", None),
+        )
+        if fmt != (4, 32, "mxfp4") or "bias" not in p:
+            return None
+    k = indices.shape[-1]
+    T = indices.size // k
+    E, D = glu.gate_proj.weight.shape[0], x.shape[-1]
+    if T * k / E > FP4_MAX_LOAD:
+        return None
+    weights = [a for p in projs for a in (p.weight, p.scales)]
+    weights += [p.bias.astype(mx.float32) for p in projs]
+    y = _fp4_ops[act](
+        x.reshape(T, D), indices.reshape(T, k).astype(mx.uint32), *weights
+    )
     return y.reshape(*indices.shape, D)

@@ -174,6 +174,7 @@ class SwitchLinear(nn.Module):
 
 class SwiGLU(nn.Module):
     metal_act = 0  # activation id for switch_kernels: silu(gate) * x
+    metal_act_fp4 = 0
 
     def __init__(self):
         super().__init__()

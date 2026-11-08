@@ -33,6 +33,8 @@ class SwigluOAI(nn.Module):
         super().__init__()
         self._alpha = alpha
         self._limit = limit
+        # activation id for switch_kernels (MXFP4 path); the kernels hard-code these constants
+        self.metal_act_fp4 = 1 if (alpha, limit) == (1.702, 7.0) else None
 
     def __call__(self, x: mx.array, gate: mx.array) -> mx.array:
         return swiglu_oai(gate, x, alpha=self._alpha, limit=self._limit)
